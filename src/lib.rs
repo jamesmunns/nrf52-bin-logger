@@ -19,17 +19,30 @@ use heapless::{
 };
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
-pub enum LogOnLine<'a, T> {
+pub enum LogOnLine<'a, T>
+where
+    T: Serialize,
+{
     Log(&'a str),
     Warn(&'a str),
     Error(&'a str),
-    BinaryRaw(&'a [u8]),
+    BinaryRaw(BinMessage<'a>),
     ProtocolMessage(T),
 }
 
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct BinMessage<'a> {
+    description: &'a str,
+    data: &'a [u8],
+}
+
+/// A binary logging interface, using UARTE0.
+///
+/// In the future other serial interfaces might be supported
 pub struct Logger<BUFSZ, T>
 where
     BUFSZ: ArrayLength<u8>,
+    T: Serialize,
 {
     uart: Uarte<UARTE0>,
     _scratch_sz: PhantomData<BUFSZ>,
@@ -52,22 +65,30 @@ where
         }
     }
 
+    /// Send a log level &str message
     pub fn log(&mut self, data: &str) -> Result<(), ()> {
         self.send(&LogOnLine::Log(data))
     }
 
+    /// Send a warn level &str message
     pub fn warn(&mut self, data: &str) -> Result<(), ()> {
         self.send(&LogOnLine::Warn(data))
     }
 
+    /// Send an error level &str message
     pub fn error(&mut self, data: &str) -> Result<(), ()> {
         self.send(&LogOnLine::Error(data))
     }
 
-    pub fn raw_bin(&mut self, data: &[u8]) -> Result<(), ()> {
-        self.send(&LogOnLine::BinaryRaw(data))
+    /// Send a byte slice message
+    pub fn raw_bin(&mut self, description: &str, data: &[u8]) -> Result<(), ()> {
+        self.send(&LogOnLine::BinaryRaw(BinMessage {
+            description,
+            data,
+        }))
     }
 
+    /// Send a log level &str message
     pub fn data(&mut self, data: T) -> Result<(), ()> {
         self.send(&LogOnLine::ProtocolMessage(data))
     }

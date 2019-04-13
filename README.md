@@ -4,6 +4,8 @@ A binary protocol for UARTE logging on the nRF52
 
 Only supports the nrf52832 right now.
 
+Eventually I'll probably just make this an `embedded-hal` crate. Oops.
+
 ## License
 
 Licensed under either of
