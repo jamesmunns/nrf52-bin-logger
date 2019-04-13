@@ -1,0 +1,36 @@
+[package]
+name = "nrf52-bin-logger"
+version = "0.1.0"
+authors = ["James Munns <james.munns@ferrous-systems.com>"]
+edition = "2018"
+readme = "README.md"
+repository = "https://github.com/jamesmunns/nrf52-bin-logger"
+description = "A binary protocol for UARTE logging on the nRF52"
+license = "MIT OR Apache-2.0"
+categories = [
+    "embedded",
+    "no-std",
+]
+keywords = [
+    "nordic",
+    "nrf52",
+    "serde",
+    "cobs",
+    "framing",
+]
+documentation = "https://docs.rs/nrf52-bin-logger/"
+
+[dependencies]
+postcard = "0.3.1"
+heapless = "0.4"
+
+[dependencies.serde]
+version = "1"
+default-features = false
+features = ["derive"]
+
+# TODO: Support all nrf52's by depending on nrf52-hal-common,
+# makes this crate harder to build in place, probably fix this
+# by providing an example that picks one target
+[dependencies.nrf52832-hal]
+version = "0.7.0"
