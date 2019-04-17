@@ -6,9 +6,54 @@
 //!
 //! Messages are serialized and deserialized using `postcard` + `serde`, and
 //! all messages are COBS encoded for framing. This can be used to quickly set
-//! up a communications protocol over a serial port for the nRF52.
+//! up a uni- or bi-directional communications protocol over a serial port
+//! for the nRF52.
+//!
+//! ```rust
+//! use serde::{Serialize, Deserialize};
+//! use heapless::consts::*;
+//! use nrf52_bin_logger::{Logger, senders::RealSender, receivers::RealReceiver};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! enum MyProtocol {
+//!     MsgA(u32),
+//!     MsgB(f32),
+//!     MsgC(bool),
+//! }
+//!
+//! type ModemLogger = Logger<
+//!     // `MyProtocol` outgoing messages, 16 bytes used as a serialization buffer
+//!     RealSender<MyProtocol, U16>,
+//!     // `MyProtocol` incoming messages, 16 bytes used as a deserialization buffer,
+//!     // a max of 8 `MyProtocol` messages can be enqueued
+//!     RealReceiver<MyProtocol, U16, U8>,
+//! >;
+//! ```
+//!
+//! Don't need a sender or a receiver? Just replace the type with a NullSender/NullReceiver.
+//! No code will be generated for this half of the interface.
+//!
+//! ```rust
+//! use serde::{Serialize, Deserialize};
+//! use heapless::consts::*;
+//! use nrf52_bin_logger::{Logger, senders::RealSender, receivers::NullReceiver};
+//!
+//! #[derive(Serialize, Deserialize)]
+//! enum MyProtocol {
+//!     MsgA(u32),
+//!     MsgB(f32),
+//!     MsgC(bool),
+//! }
+//!
+//! type ModemLogger = Logger<
+//!     // `MyProtocol` outgoing messages, 16 bytes used as a serialization buffer
+//!     RealSender<MyProtocol, U16>,
+//!     // Nothing will be received
+//!     NullReceiver,
+//! >;
+//! ```
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 
 use nrf52832_hal::{nrf52832_pac::UARTE0, uarte::Uarte};
 
