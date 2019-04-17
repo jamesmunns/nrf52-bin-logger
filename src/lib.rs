@@ -1,8 +1,6 @@
 #![no_std]
 
-use serde::{Serialize, Deserialize};
-use core::marker::PhantomData;
-use core::ops::{Deref};
+use core::ops::Deref;
 
 use nrf52832_hal::{
     uarte::Uarte,
@@ -12,16 +10,31 @@ use nrf52832_hal::{
     },
 };
 
-use postcard::to_vec_cobs;
+use bare_metal::Mutex;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{Ordering::SeqCst, compiler_fence};
+use cortex_m::interrupt;
 use heapless::{
     ArrayLength,
     Vec,
+    spsc::Queue,
 };
+use postcard::{to_vec_cobs, from_bytes_cobs};
+use serde::{Serialize, de::DeserializeOwned, Deserialize};
+
+
+static A_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 255]));
+static B_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 255]));
+
+#[derive(Eq, PartialEq, Debug)]
+enum PingPongMode {
+    Idle,
+    AActive,
+    BActive
+}
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub enum LogOnLine<'a, T>
-where
-    T: Serialize,
 {
     Log(&'a str),
     Warn(&'a str),
@@ -39,19 +52,21 @@ pub struct BinMessage<'a> {
 /// A binary logging interface, using UARTE0.
 ///
 /// In the future other serial interfaces might be supported
-pub struct Logger<BUFSZ, T>
+pub struct Logger<BUFSZ, T, MSGS>
 where
     BUFSZ: ArrayLength<u8>,
-    T: Serialize,
+    MSGS: ArrayLength<T>,
 {
-    pub uart: Uarte<UARTE0>,
-    _scratch_sz: PhantomData<BUFSZ>,
-    _bin_data: PhantomData<T>
+    uart: Uarte<UARTE0>,
+    inc_q: Vec<u8, BUFSZ>,
+    msg_q: Queue<T, MSGS>,
+    ppm: PingPongMode,
 }
 
-impl<BUFSZ, T> Logger<BUFSZ, T>
+impl<BUFSZ, T, MSGS> Logger<BUFSZ, T, MSGS>
 where
     BUFSZ: ArrayLength<u8>,
+    MSGS: ArrayLength<T>,
     T: Serialize,
  {
     pub fn new(mut uart: Uarte<UARTE0>) -> Self {
@@ -60,8 +75,9 @@ where
 
         Self {
             uart,
-            _scratch_sz: PhantomData,
-            _bin_data: PhantomData,
+            inc_q: Vec::new(),
+            msg_q: Queue::new(),
+            ppm: PingPongMode::Idle,
         }
     }
 
@@ -103,64 +119,43 @@ where
 
         Ok(())
     }
-}
 
-use bare_metal::Mutex;
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering::{self, SeqCst}, compiler_fence};
-use cortex_m::interrupt;
+    pub fn start_receive(&mut self) -> Result<(), ()> {
+        if self.ppm != PingPongMode::Idle {
+            return Err(());
+        }
 
-static A_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 255]));
-static B_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 255]));
-static SELECTOR: AtomicUsize = AtomicUsize::new(IDLE);
+        self.ppm = PingPongMode::AActive;
 
-const IDLE:         usize = 0b00;
-const A_ACTIVE:     usize = 0b01;
-const B_ACTIVE:     usize = 0b10;
-const MASK_ACTIVE:  usize = 0b11;
-
-
-pub trait HackRxUart {
-    fn start_receive(&mut self);
-    fn get_pending<'a, 'b>(&'b mut self, output: &'a mut [u8]) -> Result<&'a mut [u8], ()>;
-}
-
-impl HackRxUart for Uarte<UARTE0> {
-    fn start_receive(&mut self) {
         interrupt::free(|cs| {
-
-            let val = SELECTOR.compare_and_swap(IDLE, A_ACTIVE, Ordering::SeqCst);
-            assert_eq!(val, IDLE);
-
             unsafe {
                 start_read(&mut *A_SIDE.borrow(cs).get()).unwrap();
             }
         });
+
+        Ok(())
     }
 
-    fn get_pending<'a, 'b>(&'b mut self, output: &'a mut [u8]) -> Result<&'a mut [u8], ()> {
-        let mut used = 0;
+    pub fn get_pending_manual<'a, 'b>(&'b mut self, output: &'a mut [u8]) -> Result<&'a mut [u8], ()> {
+        let (old, new, new_ppm) = match self.ppm {
+            PingPongMode::AActive => (&A_SIDE, &B_SIDE, PingPongMode::BActive),
+            PingPongMode::BActive => (&B_SIDE, &A_SIDE, PingPongMode::AActive),
+            _ => return Err(())
+        };
+
+        self.ppm = new_ppm;
+
+        let periph = unsafe{ &*UARTE0::ptr() };
+        periph.tasks_stoprx.write(|w| unsafe { w.bits(1) });
+
+        while periph.events_endrx.read().bits() != 1 {}
+
+        compiler_fence(SeqCst);
+
+        let used = periph.rxd.amount.read().bits() as usize;
+        finalize_read();
 
         interrupt::free(|cs| {
-
-            let val = SELECTOR.fetch_xor(MASK_ACTIVE, SeqCst);
-
-            let (old, new) = match val {
-                A_ACTIVE => (&A_SIDE, &B_SIDE),
-                B_ACTIVE => (&B_SIDE, &A_SIDE),
-                _ => panic!(),
-            };
-
-            let periph = unsafe{ &*UARTE0::ptr() };
-            periph.tasks_stoprx.write(|w| unsafe { w.bits(1) });
-
-            while periph.events_endrx.read().bits() != 1 {}
-
-            compiler_fence(SeqCst);
-
-            used = periph.rxd.amount.read().bits() as usize;
-            finalize_read();
-
             unsafe {
                 start_read(&mut *new.borrow(cs).get()).unwrap();
                 (&mut output[..used]).copy_from_slice(&mut (*old.borrow(cs).get())[..used]);
@@ -170,6 +165,47 @@ impl HackRxUart for Uarte<UARTE0> {
         Ok(&mut output[..used])
     }
 }
+
+impl<BUFSZ, T, MSGS> Logger<BUFSZ, T, MSGS>
+where
+    BUFSZ: ArrayLength<u8>,
+    MSGS: ArrayLength<T>,
+    T: Serialize + DeserializeOwned,
+{
+    pub fn service_receive(&mut self) -> Result<usize, ()> {
+        let mut buf = [0u8; 255];
+        let mut less_buf = self.get_pending_manual(&mut buf)?;
+
+        if less_buf.len() > 0 {
+            while let Some(idx) = less_buf.iter().position(|&n| n == 0u8) {
+                let (frm, lat) = less_buf.split_at_mut(idx + 1);
+
+                self.inc_q.extend_from_slice(frm).unwrap();
+                self.msg_q.enqueue(
+                    from_bytes_cobs(&mut *self.inc_q)
+                        .map_err(|_| ())?)
+                    .map_err(|_| ())?;
+                self.inc_q.clear();
+
+                less_buf = lat;
+            }
+
+            self.inc_q.extend_from_slice(less_buf).unwrap();
+        }
+
+        Ok(self.msg_q.len())
+    }
+
+    pub fn get_msg(&mut self) -> Option<T> {
+        self.msg_q.dequeue()
+    }
+}
+
+////////////////////////////////////////////////////////////////////////
+// These functions are taken from nrf52-hal. This is because
+// they are private functions (rightly so), but we need this
+// behavior to enable non-blocking reading to the ping pong
+// buffers
 
 
 /// Start a UARTE read transaction by setting the control
