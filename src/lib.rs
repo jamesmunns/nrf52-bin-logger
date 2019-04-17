@@ -44,7 +44,7 @@ where
     BUFSZ: ArrayLength<u8>,
     T: Serialize,
 {
-    uart: Uarte<UARTE0>,
+    pub uart: Uarte<UARTE0>,
     _scratch_sz: PhantomData<BUFSZ>,
     _bin_data: PhantomData<T>
 }
@@ -103,4 +103,127 @@ where
 
         Ok(())
     }
+}
+
+use bare_metal::Mutex;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering::{self, SeqCst}, compiler_fence};
+use cortex_m::interrupt;
+
+static A_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 255]));
+static B_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 255]));
+static SELECTOR: AtomicUsize = AtomicUsize::new(IDLE);
+
+const IDLE:         usize = 0b00;
+const A_ACTIVE:     usize = 0b01;
+const B_ACTIVE:     usize = 0b10;
+const MASK_ACTIVE:  usize = 0b11;
+
+
+pub trait HackRxUart {
+    fn start_receive(&mut self);
+    fn get_pending<'a, 'b>(&'b mut self, output: &'a mut [u8]) -> Result<&'a mut [u8], ()>;
+}
+
+impl HackRxUart for Uarte<UARTE0> {
+    fn start_receive(&mut self) {
+        interrupt::free(|cs| {
+
+            let val = SELECTOR.compare_and_swap(IDLE, A_ACTIVE, Ordering::SeqCst);
+            assert_eq!(val, IDLE);
+
+            unsafe {
+                start_read(&mut *A_SIDE.borrow(cs).get()).unwrap();
+            }
+        });
+    }
+
+    fn get_pending<'a, 'b>(&'b mut self, output: &'a mut [u8]) -> Result<&'a mut [u8], ()> {
+        let mut used = 0;
+
+        interrupt::free(|cs| {
+
+            let val = SELECTOR.fetch_xor(MASK_ACTIVE, SeqCst);
+
+            let (old, new) = match val {
+                A_ACTIVE => (&A_SIDE, &B_SIDE),
+                B_ACTIVE => (&B_SIDE, &A_SIDE),
+                _ => panic!(),
+            };
+
+            let periph = unsafe{ &*UARTE0::ptr() };
+            periph.tasks_stoprx.write(|w| unsafe { w.bits(1) });
+
+            while periph.events_endrx.read().bits() != 1 {}
+
+            compiler_fence(SeqCst);
+
+            used = periph.rxd.amount.read().bits() as usize;
+            finalize_read();
+
+            unsafe {
+                start_read(&mut *new.borrow(cs).get()).unwrap();
+                (&mut output[..used]).copy_from_slice(&mut (*old.borrow(cs).get())[..used]);
+            }
+        });
+
+        Ok(&mut output[..used])
+    }
+}
+
+
+/// Start a UARTE read transaction by setting the control
+/// values and triggering a read task
+fn start_read(rx_buffer: &mut [u8]) -> Result<(), nrf52832_hal::uarte::Error> {
+    let periph = unsafe{ &*UARTE0::ptr() };
+
+    // This is overly restrictive. See (similar SPIM issue):
+    // https://github.com/nrf-rs/nrf52/issues/17
+    if rx_buffer.len() > u8::max_value() as usize {
+        return Err(nrf52832_hal::uarte::Error::TxBufferTooLong);
+    }
+
+    // Conservative compiler fence to prevent optimizations that do not
+    // take in to account actions by DMA. The fence has been placed here,
+    // before any DMA action has started
+    compiler_fence(SeqCst);
+
+    // Set up the DMA read
+    periph.rxd.ptr.write(|w|
+        // We're giving the register a pointer to the stack. Since we're
+        // waiting for the UARTE transaction to end before this stack pointer
+        // becomes invalid, there's nothing wrong here.
+        //
+        // The PTR field is a full 32 bits wide and accepts the full range
+        // of values.
+        unsafe { w.ptr().bits(rx_buffer.as_ptr() as u32) }
+    );
+    periph.rxd.maxcnt.write(|w|
+        // We're giving it the length of the buffer, so no danger of
+        // accessing invalid memory. We have verified that the length of the
+        // buffer fits in an `u8`, so the cast to `u8` is also fine.
+        //
+        // The MAXCNT field is at least 8 bits wide and accepts the full
+        // range of values.
+        unsafe { w.maxcnt().bits(rx_buffer.len() as _) });
+
+    // Start UARTE Receive transaction
+    periph.tasks_startrx.write(|w|
+        // `1` is a valid value to write to task registers.
+        unsafe { w.bits(1) });
+
+    Ok(())
+}
+
+/// Finalize a UARTE read transaction by clearing the event
+fn finalize_read() {
+    let periph = unsafe{ &*UARTE0::ptr() };
+
+    // Reset the event, otherwise it will always read `1` from now on.
+    periph.events_endrx.write(|w| w);
+
+    // Conservative compiler fence to prevent optimizations that do not
+    // take in to account actions by DMA. The fence has been placed here,
+    // after all possible DMA actions have completed
+    compiler_fence(SeqCst);
 }

@@ -23,6 +23,11 @@ documentation = "https://docs.rs/nrf52-bin-logger/"
 [dependencies]
 postcard = "0.3.1"
 heapless = "0.4"
+cortex-m = "0.5"
+
+[dependencies.bare-metal]
+version = "0.2"
+features = ["const-fn"]
 
 [dependencies.serde]
 version = "1"
