@@ -2,26 +2,15 @@
 
 use core::ops::Deref;
 
-use nrf52832_hal::{
-    uarte::Uarte,
-    target_constants::EASY_DMA_SIZE,
-    nrf52832_pac::{
-        UARTE0,
-    },
-};
+use nrf52832_hal::{nrf52832_pac::UARTE0, target_constants::EASY_DMA_SIZE, uarte::Uarte};
 
 use bare_metal::Mutex;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{Ordering::SeqCst, compiler_fence};
+use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
 use cortex_m::interrupt;
-use heapless::{
-    ArrayLength,
-    Vec,
-    spsc::Queue,
-};
-use postcard::{to_vec_cobs, from_bytes_cobs};
-use serde::{Serialize, de::DeserializeOwned, Deserialize};
-
+use heapless::{spsc::Queue, ArrayLength, Vec};
+use postcard::{from_bytes_cobs, to_vec_cobs};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 static A_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 255]));
 static B_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 255]));
@@ -30,12 +19,11 @@ static B_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 2
 enum PingPongMode {
     Idle,
     AActive,
-    BActive
+    BActive,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
-pub enum LogOnLine<'a, T>
-{
+pub enum LogOnLine<'a, T> {
     Log(&'a str),
     Warn(&'a str),
     Error(&'a str),
@@ -68,7 +56,7 @@ where
     BUFSZ: ArrayLength<u8>,
     MSGS: ArrayLength<T>,
     T: Serialize,
- {
+{
     pub fn new(mut uart: Uarte<UARTE0>) -> Self {
         // Send termination character
         uart.write(&[0x00]).unwrap();
@@ -98,10 +86,7 @@ where
 
     /// Send a byte slice message
     pub fn raw_bin(&mut self, description: &str, data: &[u8]) -> Result<(), ()> {
-        self.send(&LogOnLine::BinaryRaw(BinMessage {
-            description,
-            data,
-        }))
+        self.send(&LogOnLine::BinaryRaw(BinMessage { description, data }))
     }
 
     /// Send a log level &str message
@@ -127,25 +112,26 @@ where
 
         self.ppm = PingPongMode::AActive;
 
-        interrupt::free(|cs| {
-            unsafe {
-                start_read(&mut *A_SIDE.borrow(cs).get()).unwrap();
-            }
+        interrupt::free(|cs| unsafe {
+            start_read(&mut *A_SIDE.borrow(cs).get()).unwrap();
         });
 
         Ok(())
     }
 
-    pub fn get_pending_manual<'a, 'b>(&'b mut self, output: &'a mut [u8]) -> Result<&'a mut [u8], ()> {
+    pub fn get_pending_manual<'a, 'b>(
+        &'b mut self,
+        output: &'a mut [u8],
+    ) -> Result<&'a mut [u8], ()> {
         let (old, new, new_ppm) = match self.ppm {
             PingPongMode::AActive => (&A_SIDE, &B_SIDE, PingPongMode::BActive),
             PingPongMode::BActive => (&B_SIDE, &A_SIDE, PingPongMode::AActive),
-            _ => return Err(())
+            _ => return Err(()),
         };
 
         self.ppm = new_ppm;
 
-        let periph = unsafe{ &*UARTE0::ptr() };
+        let periph = unsafe { &*UARTE0::ptr() };
         periph.tasks_stoprx.write(|w| unsafe { w.bits(1) });
 
         while periph.events_endrx.read().bits() != 1 {}
@@ -155,11 +141,9 @@ where
         let used = periph.rxd.amount.read().bits() as usize;
         finalize_read();
 
-        interrupt::free(|cs| {
-            unsafe {
-                start_read(&mut *new.borrow(cs).get()).unwrap();
-                (&mut output[..used]).copy_from_slice(&mut (*old.borrow(cs).get())[..used]);
-            }
+        interrupt::free(|cs| unsafe {
+            start_read(&mut *new.borrow(cs).get()).unwrap();
+            (&mut output[..used]).copy_from_slice(&mut (*old.borrow(cs).get())[..used]);
         });
 
         Ok(&mut output[..used])
@@ -181,9 +165,8 @@ where
                 let (frm, lat) = less_buf.split_at_mut(idx + 1);
 
                 self.inc_q.extend_from_slice(frm).unwrap();
-                self.msg_q.enqueue(
-                    from_bytes_cobs(&mut *self.inc_q)
-                        .map_err(|_| ())?)
+                self.msg_q
+                    .enqueue(from_bytes_cobs(&mut *self.inc_q).map_err(|_| ())?)
                     .map_err(|_| ())?;
                 self.inc_q.clear();
 
@@ -207,11 +190,10 @@ where
 // behavior to enable non-blocking reading to the ping pong
 // buffers
 
-
 /// Start a UARTE read transaction by setting the control
 /// values and triggering a read task
 fn start_read(rx_buffer: &mut [u8]) -> Result<(), nrf52832_hal::uarte::Error> {
-    let periph = unsafe{ &*UARTE0::ptr() };
+    let periph = unsafe { &*UARTE0::ptr() };
 
     // This is overly restrictive. See (similar SPIM issue):
     // https://github.com/nrf-rs/nrf52/issues/17
@@ -232,8 +214,7 @@ fn start_read(rx_buffer: &mut [u8]) -> Result<(), nrf52832_hal::uarte::Error> {
         //
         // The PTR field is a full 32 bits wide and accepts the full range
         // of values.
-        unsafe { w.ptr().bits(rx_buffer.as_ptr() as u32) }
-    );
+        unsafe { w.ptr().bits(rx_buffer.as_ptr() as u32) });
     periph.rxd.maxcnt.write(|w|
         // We're giving it the length of the buffer, so no danger of
         // accessing invalid memory. We have verified that the length of the
@@ -253,7 +234,7 @@ fn start_read(rx_buffer: &mut [u8]) -> Result<(), nrf52832_hal::uarte::Error> {
 
 /// Finalize a UARTE read transaction by clearing the event
 fn finalize_read() {
-    let periph = unsafe{ &*UARTE0::ptr() };
+    let periph = unsafe { &*UARTE0::ptr() };
 
     // Reset the event, otherwise it will always read `1` from now on.
     periph.events_endrx.write(|w| w);
