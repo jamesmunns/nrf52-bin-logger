@@ -1,5 +1,14 @@
-#![no_std]
+//! `nrf52-bin-logger`
+//!
+//! This is a handy way to change the nRF52 UART from a byte-stream oriented
+//! interface to a "Rust Struct" focused interface. Users can decide if they
+//! want to send, receive, or do both over the serial port.
+//!
+//! Messages are serialized and deserialized using `postcard` + `serde`, and
+//! all messages are COBS encoded for framing. This can be used to quickly set
+//! up a communications protocol over a serial port for the nRF52.
 
+#![no_std]
 
 use nrf52832_hal::{nrf52832_pac::UARTE0, uarte::Uarte};
 
@@ -7,7 +16,7 @@ use bare_metal::Mutex;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
 use cortex_m::interrupt;
-use heapless::{spsc::Queue, ArrayLength, Vec};
+use heapless::ArrayLength;
 use postcard::{from_bytes_cobs};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -15,22 +24,30 @@ static A_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 2
 static B_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 255]));
 
 mod nrf52_ports;
-mod senders;
+pub mod senders;
+pub mod receivers;
 
 use nrf52_ports::{
     start_read,
     finalize_read,
 };
-use senders::*;
+use senders::{
+    Sender,
+};
+use receivers::{
+    PingPongMode,
+    RealReceiver,
+    Receiver,
+};
 
 mod private {
     use heapless::ArrayLength;
 
     pub trait Sealed {}
 
-    impl Sealed for crate::NullReceiver {}
+    impl Sealed for crate::receivers::NullReceiver {}
     impl Sealed for crate::senders::NullSender {}
-    impl<T, U, V> Sealed for crate::RealReceiver<T, U, V>
+    impl<T, U, V> Sealed for crate::receivers::RealReceiver<T, U, V>
     where
         U: ArrayLength<u8>,
         V: ArrayLength<T>,
@@ -40,78 +57,32 @@ mod private {
         U: ArrayLength<u8>,
     {}
 }
-use crate::private::Sealed;
 
-#[derive(Eq, PartialEq, Debug)]
-enum PingPongMode {
-    Idle,
-    AActive,
-    BActive,
-}
-
+/// This is the primary type sent via the Sender
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub enum LogOnLine<'a, T> {
+    /// A Log Level Message
     Log(&'a str),
+
+    /// A Warning Level Message
     Warn(&'a str),
+
+    /// An Error Level Message
     Error(&'a str),
+
+    /// A binary payload, with a human readable description
     BinaryRaw(BinMessage<'a>),
+
+    /// A type chosen by the user as a general communication protocol
     ProtocolMessage(T),
 }
 
+/// A binary payload with UTF-8 Description
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct BinMessage<'a> {
     description: &'a str,
     data: &'a [u8],
 }
-
-
-pub trait Receiver: Default + Sealed {}
-
-pub struct RealReceiver<T, BUFSZ, MSGCT>
-where
-    BUFSZ: ArrayLength<u8>,
-    MSGCT: ArrayLength<T>,
-{
-    inc_q: Vec<u8, BUFSZ>,
-    msg_q: Queue<T, MSGCT>,
-    ppm: PingPongMode,
-}
-
-pub struct NullReceiver;
-
-impl Receiver for NullReceiver {}
-
-
-impl<T, BUFSZ, MSGCT> Receiver for RealReceiver<T, BUFSZ, MSGCT>
-where
-    BUFSZ: ArrayLength<u8>,
-    MSGCT: ArrayLength<T>,
-{
-
-}
-
-impl<T, BUFSZ, MSGCT> Default for RealReceiver<T, BUFSZ, MSGCT>
-where
-    BUFSZ: ArrayLength<u8>,
-    MSGCT: ArrayLength<T>,
-{
-    fn default() -> Self {
-        Self {
-            inc_q: Vec::new(),
-            msg_q: Queue::new(),
-            ppm: PingPongMode::Idle,
-        }
-    }
-}
-
-impl Default for NullReceiver
-{
-    fn default() -> Self {
-        NullReceiver
-    }
-}
-
-
 
 /// A binary logging interface, using UARTE0.
 ///
@@ -133,6 +104,8 @@ where
 {
     pub fn new(mut uart: Uarte<UARTE0>) -> Self {
         // Send termination character
+        // NOTE: this only ever returns an error if the buffer passed in is >= DMA_SIZE.
+        // Since we always use a fixed buffer of 1, this can never fail
         uart.write(&[0x00]).unwrap();
 
         Self {
@@ -144,8 +117,6 @@ where
 
 }
 
-
-
 impl<SEND, T, BUFSZ, MSGCT> Logger<SEND, RealReceiver<T, BUFSZ, MSGCT>>
 where
     T: DeserializeOwned,
@@ -153,6 +124,7 @@ where
     MSGCT: ArrayLength<T>,
     SEND: Sender + Default,
 {
+    /// Start the receive process using the internal double-buffers
     pub fn start_receive(&mut self) -> Result<(), ()> {
         if self.recv.ppm != PingPongMode::Idle {
             return Err(());
@@ -161,12 +133,27 @@ where
         self.recv.ppm = PingPongMode::AActive;
 
         interrupt::free(|cs| unsafe {
+            // NOTE: this only ever returns an error if the buffer passed in is >= DMA_SIZE.
+            // Since we always use a fixed buffer of 255, this can never fail
             start_read(&mut *A_SIDE.borrow(cs).get()).unwrap();
         });
 
         Ok(())
     }
 
+    /// Obtain any pending bytes in the active buffer. This also causes
+    /// the internal double buffers to flip. When this function is successful,
+    /// a sub-slice of `output` is returned, containing the read bytes.
+    ///
+    /// Bytes are obtained as they are received on the line, so decoding
+    /// and deserialization must be performed manually.
+    ///
+    /// NOTE: Either this function or `service_receive()` must be polled
+    /// periodically, or there will be data loss! In general, the calculation
+    /// for "how often do I need to poll this" is `1 / (BAUDRATE / LINE_BITS_PER_DATA_BYTE / 255)`.
+    ///
+    /// For example, at 230400 Baud, and 8N1 settings (8 data bits per 10 line bits), it is necessary
+    /// to poll this function once per ~11ms.
     pub fn get_pending_manual<'a, 'b>(
         &'b mut self,
         output: &'a mut [u8],
@@ -190,6 +177,8 @@ where
         finalize_read();
 
         interrupt::free(|cs| unsafe {
+            // NOTE: this only ever returns an error if the buffer passed in is >= DMA_SIZE.
+            // Since we always use a fixed buffer of 255, this can never fail
             start_read(&mut *new.borrow(cs).get()).unwrap();
             (&mut output[..used]).copy_from_slice(&mut (*old.borrow(cs).get())[..used]);
         });
@@ -197,30 +186,57 @@ where
         Ok(&mut output[..used])
     }
 
-
+    /// This is an automatic handler, that will clear any pending
+    /// bytes, and attempt to parse any pending messages. If successful,
+    /// the return value is the number messages ready to be cleared with
+    /// `get_msg()`.
+    ///
+    /// NOTE: Either this function or `get_pending_manual()` must be polled
+    /// periodically, or there will be data loss! In general, the calculation
+    /// for "how often do I need to poll this" is `1 / (BAUDRATE / LINE_BITS_PER_DATA_BYTE / 255)`.
+    ///
+    /// For example, at 230400 Baud, and 8N1 settings (8 data bits per 10 line bits), it is necessary
+    /// to poll this function once per ~11ms.
+    ///
+    /// Care must also be taken to ensure that MSGCT has a deep enough queue.
     pub fn service_receive(&mut self) -> Result<usize, ()> {
         let mut buf = [0u8; 255];
         let mut less_buf = self.get_pending_manual(&mut buf)?;
 
+        // If we've received any data...
         if less_buf.len() > 0 {
+            // See if this new data contains a `0`, the cobs framing byte
             while let Some(idx) = less_buf.iter().position(|&n| n == 0u8) {
+                // Split the new buffer, including the framing byte in the
+                // broken off chunk...
                 let (frm, lat) = less_buf.split_at_mut(idx + 1);
 
-                self.recv.inc_q.extend_from_slice(frm).unwrap();
-                self.recv.msg_q
-                    .enqueue(from_bytes_cobs(&mut *self.recv.inc_q).map_err(|_| ())?)
-                    .map_err(|_| ())?;
+                // If we can't push, just drain the buffer
+                if self.recv.inc_q.extend_from_slice(frm).is_ok() {
+                    // Silently discard any poorly serialized or encoded messages
+                    // Keep trying to decode further messages to prevent data loss
+                    if let Ok(msg) = from_bytes_cobs(&mut *self.recv.inc_q) {
+                        self.recv.msg_q
+                            .enqueue(msg)
+                            .map_err(|_| ())?;
+                    }
+                }
+
                 self.recv.inc_q.clear();
 
                 less_buf = lat;
             }
 
-            self.recv.inc_q.extend_from_slice(less_buf).unwrap();
+            // No room? No message.
+            if self.recv.inc_q.extend_from_slice(less_buf).is_err() {
+                self.recv.inc_q.clear();
+            }
         }
 
         Ok(self.recv.msg_q.len())
     }
 
+    /// Pop a single message off of the decoded/deserialized queue
     pub fn get_msg(&mut self) -> Option<T> {
         self.recv.msg_q.dequeue()
     }

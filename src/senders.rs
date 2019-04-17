@@ -1,3 +1,6 @@
+//! These items are used for sending data to another device, such as logging to a PC.
+
+
 use core::ops::Deref;
 use core::marker::PhantomData;
 
