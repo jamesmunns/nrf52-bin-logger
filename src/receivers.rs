@@ -1,7 +1,9 @@
 //! These items are used to obtain data from an external device to the nRF52, such as an incoming command.
 
+#[cfg(feature = "unstable")]
 use heapless::{spsc::Queue, ArrayLength, Vec};
 
+#[cfg(feature = "unstable")]
 #[derive(Eq, PartialEq, Debug)]
 pub(crate) enum PingPongMode {
     Idle,
@@ -31,6 +33,7 @@ pub trait Receiver: Default + crate::private::Sealed {}
 /// decoded, messages will be enqueued here for reception
 ///
 /// This sender currently blocks during transmission
+#[cfg(feature = "unstable")]
 pub struct RealReceiver<T, BUFSZ, MSGCT>
 where
     BUFSZ: ArrayLength<u8>,
@@ -48,15 +51,15 @@ pub struct NullReceiver;
 // Fulfill the marker trait
 impl Receiver for NullReceiver {}
 
-
+#[cfg(feature = "unstable")]
 impl<T, BUFSZ, MSGCT> Receiver for RealReceiver<T, BUFSZ, MSGCT>
 where
     BUFSZ: ArrayLength<u8>,
     MSGCT: ArrayLength<T>,
 {
-
 }
 
+#[cfg(feature = "unstable")]
 impl<T, BUFSZ, MSGCT> Default for RealReceiver<T, BUFSZ, MSGCT>
 where
     BUFSZ: ArrayLength<u8>,
@@ -71,11 +74,8 @@ where
     }
 }
 
-impl Default for NullReceiver
-{
+impl Default for NullReceiver {
     fn default() -> Self {
         NullReceiver
     }
 }
-
-

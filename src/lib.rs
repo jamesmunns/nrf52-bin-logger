@@ -57,33 +57,39 @@
 
 use nrf52832_hal::{nrf52832_pac::UARTE0, uarte::Uarte};
 
-use bare_metal::Mutex;
-use core::cell::UnsafeCell;
-use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
-use cortex_m::interrupt;
-use heapless::ArrayLength;
-use postcard::{from_bytes_cobs};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+#[cfg(feature = "unstable")]
+mod unstable {
+    pub(crate) use core::cell::UnsafeCell;
+    pub(crate) use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
 
+    pub(crate) use crate::nrf52_ports::start_read;
+    pub(crate) use crate::receivers::{PingPongMode, RealReceiver};
+
+    pub(crate) use bare_metal::Mutex;
+    pub(crate) use cortex_m::interrupt;
+    pub(crate) use heapless::ArrayLength;
+    pub(crate) use postcard::from_bytes_cobs;
+    pub(crate) use serde::de::DeserializeOwned;
+}
+
+#[cfg(feature = "unstable")]
+use crate::unstable::*;
+
+#[cfg(feature = "unstable")]
 static A_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 255]));
+#[cfg(feature = "unstable")]
 static B_SIDE: Mutex<UnsafeCell<[u8; 255]>> = Mutex::new(UnsafeCell::new([0u8; 255]));
 
-mod nrf52_ports;
-pub mod senders;
-pub mod receivers;
+use serde::{Deserialize, Serialize};
 
-use nrf52_ports::{
-    start_read,
-    finalize_read,
-};
-use senders::{
-    Sender,
-};
-use receivers::{
-    PingPongMode,
-    RealReceiver,
-    Receiver,
-};
+#[cfg(feature = "unstable")]
+mod nrf52_ports;
+
+pub mod receivers;
+pub mod senders;
+
+use receivers::Receiver;
+use senders::Sender;
 
 mod private {
     use heapless::ArrayLength;
@@ -92,15 +98,15 @@ mod private {
 
     impl Sealed for crate::receivers::NullReceiver {}
     impl Sealed for crate::senders::NullSender {}
+
+    #[cfg(feature = "unstable")]
     impl<T, U, V> Sealed for crate::receivers::RealReceiver<T, U, V>
     where
         U: ArrayLength<u8>,
         V: ArrayLength<T>,
-    {}
-    impl<T, U> Sealed for crate::senders::RealSender<T, U>
-    where
-        U: ArrayLength<u8>,
-    {}
+    {
+    }
+    impl<T, U> Sealed for crate::senders::RealSender<T, U> where U: ArrayLength<u8> {}
 }
 
 /// This is the primary type sent via the Sender
@@ -130,7 +136,7 @@ pub struct BinMessage<'a> {
 }
 
 /// A binary logging interface, using UARTE0.
-///
+///target
 /// In the future other serial interfaces might be supported
 pub struct Logger<SEND, RECV>
 where
@@ -139,7 +145,17 @@ where
 {
     uart: Uarte<UARTE0>,
     _send: SEND,
+
+    #[allow(dead_code)]
     recv: RECV,
+    pub good_msgs: usize,
+    pub good_bytes: usize,
+    pub dropped_bytes: usize,
+    pub dropped_msgs: usize,
+    pub bad_cobs: usize,
+    pub full_buf: usize,
+    pub full_msg: usize,
+    pub ttl_got: usize,
 }
 
 impl<SEND, RECV> Logger<SEND, RECV>
@@ -157,11 +173,19 @@ where
             uart,
             _send: SEND::default(),
             recv: RECV::default(),
+            dropped_msgs: 0,
+            dropped_bytes: 0,
+            bad_cobs: 0,
+            full_buf: 0,
+            full_msg: 0,
+            good_msgs: 0,
+            good_bytes: 0,
+            ttl_got: 0,
         }
     }
-
 }
 
+#[cfg(feature = "unstable")]
 impl<SEND, T, BUFSZ, MSGCT> Logger<SEND, RealReceiver<T, BUFSZ, MSGCT>>
 where
     T: DeserializeOwned,
@@ -177,10 +201,13 @@ where
 
         self.recv.ppm = PingPongMode::AActive;
 
+        let periph = unsafe { &*UARTE0::ptr() };
+        periph.events_rxdrdy.write(|w| unsafe { w.bits(0) });
+
         interrupt::free(|cs| unsafe {
             // NOTE: this only ever returns an error if the buffer passed in is >= DMA_SIZE.
             // Since we always use a fixed buffer of 255, this can never fail
-            start_read(&mut *A_SIDE.borrow(cs).get()).unwrap();
+            start_read(&mut *A_SIDE.borrow(cs).get(), false).unwrap();
         });
 
         Ok(())
@@ -203,6 +230,13 @@ where
         &'b mut self,
         output: &'a mut [u8],
     ) -> Result<&'a mut [u8], ()> {
+        let periph = unsafe { &*UARTE0::ptr() };
+
+        if periph.events_rxdrdy.read().bits() == 0 {
+            return Ok(&mut []);
+        }
+        periph.events_rxdrdy.write(|w| unsafe { w.bits(0) });
+
         let (old, new, new_ppm) = match self.recv.ppm {
             PingPongMode::AActive => (&A_SIDE, &B_SIDE, PingPongMode::BActive),
             PingPongMode::BActive => (&B_SIDE, &A_SIDE, PingPongMode::AActive),
@@ -211,24 +245,37 @@ where
 
         self.recv.ppm = new_ppm;
 
-        let periph = unsafe { &*UARTE0::ptr() };
         periph.tasks_stoprx.write(|w| unsafe { w.bits(1) });
 
         while periph.events_endrx.read().bits() != 1 {}
+        periph.events_endrx.write(|w| unsafe { w.bits(0) });
 
+        while periph.events_rxto.read().bits() != 1 {}
+        periph.events_rxto.write(|w| unsafe { w.bits(0) });
         compiler_fence(SeqCst);
 
         let used = periph.rxd.amount.read().bits() as usize;
-        finalize_read();
+        self.ttl_got += used;
+        if used == 255 {
+            panic!("FULL!");
+        }
 
         interrupt::free(|cs| unsafe {
             // NOTE: this only ever returns an error if the buffer passed in is >= DMA_SIZE.
             // Since we always use a fixed buffer of 255, this can never fail
-            start_read(&mut *new.borrow(cs).get()).unwrap();
-            (&mut output[..used]).copy_from_slice(&mut (*old.borrow(cs).get())[..used]);
+            start_read(&mut *new.borrow(cs).get(), true).unwrap();
+            if used > 0 {
+                (&mut output[..used]).copy_from_slice(&mut (*old.borrow(cs).get())[..used]);
+            }
         });
 
-        Ok(&mut output[..used])
+        compiler_fence(SeqCst);
+
+        if used > 0 {
+            Ok(&mut output[..used])
+        } else {
+            Ok(&mut [])
+        }
     }
 
     /// This is an automatic handler, that will clear any pending
@@ -260,11 +307,28 @@ where
                 if self.recv.inc_q.extend_from_slice(frm).is_ok() {
                     // Silently discard any poorly serialized or encoded messages
                     // Keep trying to decode further messages to prevent data loss
+                    let mut flag = false;
+
                     if let Ok(msg) = from_bytes_cobs(&mut *self.recv.inc_q) {
-                        self.recv.msg_q
-                            .enqueue(msg)
-                            .map_err(|_| ())?;
+                        if self.recv.msg_q.enqueue(msg).is_ok() {
+                            flag = true;
+                            self.good_msgs += 1;
+                            self.good_bytes += self.recv.inc_q.len();
+                        } else {
+                            self.full_msg += 1;
+                        }
+                    } else {
+                        self.bad_cobs += 1;
                     }
+
+                    if !flag {
+                        self.dropped_bytes += self.recv.inc_q.len();
+                        self.dropped_msgs += 1;
+                    }
+                } else {
+                    self.full_buf += 1;
+                    self.dropped_bytes += self.recv.inc_q.len();
+                    self.dropped_bytes += frm.len();
                 }
 
                 self.recv.inc_q.clear();
@@ -273,8 +337,12 @@ where
             }
 
             // No room? No message.
-            if self.recv.inc_q.extend_from_slice(less_buf).is_err() {
-                self.recv.inc_q.clear();
+            if less_buf.len() > 0 {
+                if self.recv.inc_q.extend_from_slice(less_buf).is_err() {
+                    self.full_buf += 1;
+                    self.dropped_bytes += self.recv.inc_q.len();
+                    self.recv.inc_q.clear();
+                }
             }
         }
 
@@ -284,5 +352,9 @@ where
     /// Pop a single message off of the decoded/deserialized queue
     pub fn get_msg(&mut self) -> Option<T> {
         self.recv.msg_q.dequeue()
+    }
+
+    pub fn get_stats(&self) -> (usize, usize) {
+        (self.dropped_bytes, self.dropped_msgs)
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "nrf52-bin-logger"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["James Munns <james.munns@ferrous-systems.com>"]
 edition = "2018"
 readme = "README.md"
@@ -44,6 +44,7 @@ default-features = false
 [features]
 xxAA = ["nrf52832-hal/xxAA-package"]
 xxAB = ["nrf52832-hal/xxAB-package"]
+unstable = []
 
 [package.metadata.docs.rs]
-features = [ "xxAA" ]
+features = [ "xxAA", "unstable" ]

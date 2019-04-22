@@ -4,13 +4,15 @@
 // behavior to enable non-blocking reading to the ping pong
 // buffers
 
-
-use nrf52832_hal::{nrf52832_pac::UARTE0};
 use core::sync::atomic::{compiler_fence, Ordering::SeqCst};
+use nrf52832_hal::nrf52832_pac::UARTE0;
 
 /// Start a UARTE read transaction by setting the control
 /// values and triggering a read task
-pub(crate) fn start_read(rx_buffer: &mut [u8]) -> Result<(), nrf52832_hal::uarte::Error> {
+pub(crate) fn start_read(
+    rx_buffer: &mut [u8],
+    flush: bool,
+) -> Result<(), nrf52832_hal::uarte::Error> {
     let periph = unsafe { &*UARTE0::ptr() };
 
     // This is overly restrictive. See (similar SPIM issue):
@@ -42,23 +44,16 @@ pub(crate) fn start_read(rx_buffer: &mut [u8]) -> Result<(), nrf52832_hal::uarte
         // range of values.
         unsafe { w.maxcnt().bits(rx_buffer.len() as _) });
 
+    if flush {
+        periph.tasks_flushrx.write(|w| unsafe { w.bits(1) });
+        while periph.events_endrx.read().bits() != 1 {}
+        periph.events_endrx.write(|w| unsafe { w.bits(0) });
+    }
+
     // Start UARTE Receive transaction
     periph.tasks_startrx.write(|w|
         // `1` is a valid value to write to task registers.
         unsafe { w.bits(1) });
 
     Ok(())
-}
-
-/// Finalize a UARTE read transaction by clearing the event
-pub(crate) fn finalize_read() {
-    let periph = unsafe { &*UARTE0::ptr() };
-
-    // Reset the event, otherwise it will always read `1` from now on.
-    periph.events_endrx.write(|w| w);
-
-    // Conservative compiler fence to prevent optimizations that do not
-    // take in to account actions by DMA. The fence has been placed here,
-    // after all possible DMA actions have completed
-    compiler_fence(SeqCst);
 }

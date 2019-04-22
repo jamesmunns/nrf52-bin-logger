@@ -1,20 +1,19 @@
 //! These items are used for sending data to another device, such as logging to a PC.
 
-
-use core::ops::Deref;
 use core::marker::PhantomData;
+use core::ops::Deref;
 
 use nrf52832_hal::target_constants::EASY_DMA_SIZE;
 
 use heapless::{ArrayLength, Vec};
 use postcard::to_vec_cobs;
-use serde::{Serialize};
+use serde::Serialize;
 
-use crate::LogOnLine;
 use crate::private::*;
+use crate::BinMessage;
+use crate::LogOnLine;
 use crate::Logger;
 use crate::Receiver;
-use crate::BinMessage;
 
 /// The Sender trait represents options for sending from the
 /// nRF52 to another device. This is commonly used for logging.
@@ -53,13 +52,13 @@ where
 impl<T, BUFSZ> Sender for RealSender<T, BUFSZ>
 where
     T: Serialize,
-    BUFSZ: ArrayLength<u8>
-{ }
+    BUFSZ: ArrayLength<u8>,
+{
+}
 
 // We need a generic way to make a new sender, Default
 // is a good enough way
-impl Default for NullSender
-{
+impl Default for NullSender {
     fn default() -> Self {
         NullSender
     }
@@ -69,7 +68,7 @@ impl Default for NullSender
 impl<T, BUFSZ> Default for RealSender<T, BUFSZ>
 where
     T: Serialize,
-    BUFSZ: ArrayLength<u8>
+    BUFSZ: ArrayLength<u8>,
 {
     fn default() -> Self {
         RealSender {
