@@ -21,9 +21,9 @@ keywords = [
 documentation = "https://docs.rs/nrf52-bin-logger/"
 
 [dependencies]
-postcard = "0.3.1"
-heapless = "0.4"
-cortex-m = "0.5"
+postcard = "0.4.2"
+heapless = "0.5.1"
+cortex-m = "0.6.1"
 
 [dependencies.bare-metal]
 version = "0.2"
@@ -38,7 +38,7 @@ features = ["derive"]
 # makes this crate harder to build in place, probably fix this
 # by providing an example that picks one target
 [dependencies.nrf52832-hal]
-version = "0.7.0"
+version = "0.8.1"
 default-features = false
 
 [features]
